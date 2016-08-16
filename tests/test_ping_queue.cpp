@@ -35,7 +35,8 @@ using time_point = steady_clock::time_point;
 TEST_CASE("ping_queue initial state")
 {
 	time_point const start = steady_clock::now();
-	ping_queue<address_v4> q(32, start);
+	unlink("ping-queue-1");
+	ping_queue<address_v4> q("ping-queue-1", 32, start);
 
 	CHECK(q.size() == 0);
 
@@ -48,7 +49,8 @@ TEST_CASE("ping_queue overrun")
 {
 	time_point const start = steady_clock::now();
 
-	ping_queue<address_v4> q(32, start);
+	unlink("ping-queue-2");
+	ping_queue<address_v4> q("ping-queue-2", 32, start);
 
 	CHECK(q.insert_node(v4::from_string("1.2.3.4"), 6881, 0, start) == true);
 	CHECK(q.size() == 1);
@@ -72,7 +74,8 @@ TEST_CASE("ping_queue duplicate")
 {
 	time_point const start = steady_clock::now();
 
-	ping_queue<address_v4> q(32, start);
+	unlink("ping-queue-3");
+	ping_queue<address_v4> q("ping-queue-3", 32, start);
 
 	CHECK(q.insert_node(v4::from_string("1.2.3.4"), 6881, 0, start) == true);
 	CHECK(q.size() == 1);
@@ -96,7 +99,8 @@ TEST_CASE("ping_queue expire")
 {
 	time_point const start = steady_clock::now();
 
-	ping_queue<address_v4> q(32, start);
+	unlink("ping-queue-4");
+	ping_queue<address_v4> q("ping-queue-4", 32, start);
 
 	CHECK(q.insert_node(v4::from_string("1.2.3.4"), 6881, 0, start) == true);
 	CHECK(q.size() == 1);

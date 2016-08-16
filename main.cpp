@@ -488,11 +488,19 @@ std::string storage_filename(char const* base_path, int const threadid, bool con
 	return name;
 }
 
+std::string queue_filename(char const* base_path, int const threadid, bool const v6)
+{
+	char name[50];
+	std::snprintf(name, sizeof(name), "%s/ping-queue-%d-%s"
+		, base_path, threadid, v6 ? "v6" : "v4");
+	return name;
+}
+
 struct router_thread
 {
 	router_thread(char const* storage_dir, int const tid, std::vector<address> addrs)
-		: ping_queue4(ping_queue_size, steady_clock::now())
-		, ping_queue6(ping_queue_size, steady_clock::now())
+		: ping_queue4(queue_filename(storage_dir, tid, false).c_str(), ping_queue_size, steady_clock::now())
+		, ping_queue6(queue_filename(storage_dir, tid, true).c_str(), ping_queue_size, steady_clock::now())
 		, node_buffer4(storage_filename(storage_dir, tid, false).c_str(), node_buffer_size)
 		, node_buffer6(storage_filename(storage_dir, tid, true).c_str(), node_buffer_size)
 		, last_nodes4(16)

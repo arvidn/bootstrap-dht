@@ -31,6 +31,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <deque>
 
 #include "ip_set.hpp"
+#include "mapped_file.hpp"
 
 using boost::asio::ip::udp;
 using std::chrono::duration_cast;
@@ -49,14 +50,17 @@ struct ping_queue
 	using steady_clock = std::chrono::steady_clock;
 	using time_point = steady_clock::time_point;
 
-	ping_queue(size_t const capacity, time_point const now)
-		: m_capacity(capacity)
+	ping_queue(char const* filename, size_t const capacity, time_point const now)
+		: m_queue(filename, capacity)
+		, m_capacity(capacity)
 		, m_created(now)
-	{}
+	{
+		m_queue.resize(capacity);
+	}
 
 	size_t size() const
 	{
-		return m_queue.size();
+		return (m_capacity + m_write_cursor - m_read_cursor) % m_capacity;
 	}
 
 	// asks the ping-queue if there is another node that
@@ -64,15 +68,16 @@ struct ping_queue
 	bool need_ping(queued_node_t* out, time_point const now)
 	{
 		if (m_queue.empty()) return false;
+		if (m_read_cursor == m_write_cursor) return false;
 
 		// this is the number of seconds since the queue was constructed. This is
 		// compared against the expiration times on the queue entries
 		int const time_out = duration_cast<std::chrono::seconds>(
 			now - m_created).count();
 
-		if (m_queue.front().expire > time_out) return false;
-		auto ent = m_queue.front();
-		m_queue.pop_front();
+		if (m_queue[m_read_cursor].expire > time_out) return false;
+		auto const& ent = m_queue[m_read_cursor];
+		m_read_cursor = (m_read_cursor + 1) % m_capacity;
 		m_ips.erase(Address(ent.addr));
 
 		out->ep = udp::endpoint(Address(ent.addr), ent.port);
@@ -95,14 +100,15 @@ struct ping_queue
 		// nodes (to stay below the limi)
 		size_t const low_watermark = m_capacity / 2;
 
-		if (m_queue.size() > low_watermark) {
+		size_t const queue_size = size();
+		if (queue_size > low_watermark) {
 			// as the size approaches the limit, increasingly reject
 			// new nodes, to distribute nodes we ping more evenly
 			// over time.
 			// we don't start dropping nodes until we exceed the low watermark, but
 			// once we do, we increase the drop rate the closer we get to the limit
 			++m_round_robin;
-			if (m_round_robin < (m_queue.size() - low_watermark) * 256 / (m_capacity - low_watermark))
+			if (m_round_robin < (queue_size - low_watermark) * 256 / (m_capacity - low_watermark))
 				return false;
 		}
 
@@ -116,7 +122,8 @@ struct ping_queue
 		std::uint32_t const expire = duration_cast<seconds>(
 			now + minutes(15) - m_created).count();
 
-		m_queue.push_back({addr.to_bytes(), expire, std::uint16_t(sock_idx), port});
+		m_queue[m_write_cursor] = {addr.to_bytes(), expire, std::uint16_t(sock_idx), port};
+		m_write_cursor = (m_write_cursor + 1) % m_capacity;
 		m_ips.insert(addr);
 		return true;
 	}
@@ -142,11 +149,12 @@ private:
 	// the set of IPs in the queue. An IP is only allowed to appear once
 	ip_set<Address> m_ips;
 
+	size_t m_read_cursor = 0;
+	size_t m_write_cursor = 0;
+
 	// the queue of nodes we should ping, ordered by the
 	// time they were added
-	// TODO: it would be nice to keep the ping queue in a memory mapped file as
-	// well
-	std::deque<queue_entry_t> m_queue;
+	mapped_vector<queue_entry_t> m_queue;
 
 	// the total number of queue entries we're allowed to keep
 	size_t const m_capacity;
