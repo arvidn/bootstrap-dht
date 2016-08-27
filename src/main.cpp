@@ -48,6 +48,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <cinttypes> // for PRId64
 #include <array>
 
+#ifdef LOG_INVALID
+#include <fstream>
+#endif
+
 #include <boost/uuid/sha1.hpp>
 #include <boost/crc.hpp>
 #include <boost/system/error_code.hpp>
@@ -783,6 +787,12 @@ struct router_thread
 		if (err || ret != 0 || e.type() != bdecode_node::dict_t)
 		{
 			++invalid_encoding;
+#ifdef LOG_INVALID
+			static int log_seqnr = 0;
+			std::fstream pkt("invalid_packets/" + std::to_string(log_seqnr++)
+				, std::ios_base::out | std::ios_base::binary);
+			pkt.write(sock.packet, len);
+#endif
 			return;
 		}
 
@@ -1320,6 +1330,10 @@ int main(int argc, char* argv[])
 
 		bind_addrs.push_back(our_external_ip);
 	}
+
+#ifdef LOG_INVALID
+	::mkdir("invalid_packets", 0777);
+#endif
 
 	io_service ios;
 
