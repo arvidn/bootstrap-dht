@@ -126,7 +126,8 @@ std::unordered_map<uint16_t, int> client_histogram;
 
 */
 
-std::atomic<uint32_t> incoming_queries;
+std::atomic<uint32_t> incoming_queries4;
+std::atomic<uint32_t> incoming_queries6;
 std::atomic<uint32_t> incoming_duplicates;
 std::atomic<uint32_t> invalid_encoding;
 std::atomic<uint32_t> invalid_src_address;
@@ -134,11 +135,13 @@ std::atomic<uint32_t> failed_nodeid_queries;
 std::atomic<uint32_t> outgoing_pings;
 std::atomic<uint32_t> short_tid_pongs;
 std::atomic<uint32_t> invalid_pongs;
-std::atomic<uint32_t> added_nodes;
+std::atomic<uint32_t> added_nodes4;
+std::atomic<uint32_t> added_nodes6;
 std::atomic<uint32_t> backup_nodes_returned;
 
 #ifdef DEBUG_STATS
-std::array<std::atomic<uint32_t>, 4> nodebuf_size;
+// one IPv4 and one IPv6 bucket, for the first thread only
+std::array<std::atomic<uint32_t>, 2> nodebuf_size;
 #endif
 
 time_point stats_start = steady_clock::now();
@@ -189,18 +192,18 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 	static std::uint32_t cnt = 0;
 	if (cnt == 0)
 	{
-		printf("%7s%10s%10s%10s%10s%10s%10s%10s%10s%10s%10s"
+		printf("%7s%10s%10s%10s%10s%10s%10s%10s%10s%10s%10s%10s%10s"
 #ifdef DEBUG_STATS
-			"%8s%8s%8s%8s"
+			"%8s%8s"
 #endif
 #ifdef CLIENTS_STAT
 			" %s"
 #endif
 			"\n"
-			, "time(s)", "in", "dup-ip", "inv-enc", "inv-src", "id-fail"
-			, "out-ping", "short-tid", "inv-pong", "added", "backup"
+			, "time(s)", "in4", "in6", "dup-ip", "inv-enc", "inv-src", "id-fail"
+			, "out-ping", "short-tid", "inv-pong", "added4", "added6", "backup"
 #ifdef DEBUG_STATS
-			, "buf1", "buf2", "buf3", "buf4"
+			, "v4-1", "v6-1"
 #endif
 #ifdef CLIENTS_STAT
 			, "client distribution"
@@ -209,16 +212,17 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 	}
 	cnt = (cnt + 1) % 20;
 
-	printf("%7" PRId64 "%10u%10u%10u%10u%10u%10u%10u%10u%10u%10u"
+	printf("%7" PRId64 "%10u%10u%10u%10u%10u%10u%10u%10u%10u%10u%10u%10u"
 #ifdef DEBUG_STATS
-		"%8s%8s%8s%8s"
+		"%8s%8s"
 #endif
 #ifdef CLIENTS_STAT
 		" %s"
 #endif
 		"\n"
 		, duration_cast<seconds>(now - stats_start).count()
-		, incoming_queries.exchange(0)
+		, incoming_queries4.exchange(0)
+		, incoming_queries6.exchange(0)
 		, incoming_duplicates.exchange(0)
 		, invalid_encoding.exchange(0)
 		, invalid_src_address.exchange(0)
@@ -226,13 +230,12 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 		, outgoing_pings.exchange(0)
 		, short_tid_pongs.exchange(0)
 		, invalid_pongs.exchange(0)
-		, added_nodes.exchange(0)
+		, added_nodes4.exchange(0)
+		, added_nodes6.exchange(0)
 		, backup_nodes_returned.exchange(0)
 #ifdef DEBUG_STATS
 		, suffix(nodebuf_size[0].load()).c_str()
 		, suffix(nodebuf_size[1].load()).c_str()
-		, suffix(nodebuf_size[2].load()).c_str()
-		, suffix(nodebuf_size[3].load()).c_str()
 #endif
 #ifdef CLIENTS_STAT
 		, client_dist
@@ -676,8 +679,10 @@ struct router_thread
 		for (;;)
 		{
 #ifdef DEBUG_STATS
-			if (threadid < nodebuf_size.size())
-				nodebuf_size[threadid] = node_buffer4.size();
+			if (threadid == 0) {
+				nodebuf_size[0] = node_buffer4.size();
+				nodebuf_size[1] = node_buffer6.size();
+			}
 #endif
 
 			time_point const now = steady_clock::now();
@@ -888,7 +893,7 @@ struct router_thread
 						address_v4::bytes_type b;
 						std::memcpy(b.data(), i, b.size());
 						int const port = (unsigned(i[4]) << 8) | unsigned(i[5]);
-						added_nodes += node_buffer4.insert_node(address_v4(b)
+						added_nodes4 += node_buffer4.insert_node(address_v4(b)
 							, port, i + 6);
 					}
 				}
@@ -903,18 +908,18 @@ struct router_thread
 						address_v6::bytes_type b;
 						std::memcpy(b.data(), i, b.size());
 						int const port = (unsigned(i[16]) << 8) | unsigned(i[17]);
-						added_nodes += node_buffer6.insert_node(address_v6(b)
+						added_nodes6 += node_buffer6.insert_node(address_v6(b)
 							, port, i + 18);
 					}
 				}
 			}
 
 			if (is_v4) {
-				added_nodes += node_buffer4.insert_node(ep.address().to_v4()
+				added_nodes4 += node_buffer4.insert_node(ep.address().to_v4()
 					, ep.port(), node_id.string_ptr());
 			}
 			else {
-				added_nodes += node_buffer6.insert_node(ep.address().to_v6()
+				added_nodes6 += node_buffer6.insert_node(ep.address().to_v6()
 					, ep.port(), node_id.string_ptr());
 			}
 		}
@@ -1032,7 +1037,8 @@ struct router_thread
 			}
 
 			b.close_dict();
-			++incoming_queries;
+			if (is_v4) ++incoming_queries4;
+			else ++incoming_queries6;
 
 			int len = sock.sock.send_to(buffer(response, b.end() - response), ep, 0, ec);
 			if (ec)
