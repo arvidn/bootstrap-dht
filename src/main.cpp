@@ -850,7 +850,7 @@ struct router_thread
 				return;
 			}
 		}
-		bdecode_node node_id = a.dict_find_string("id");
+		bdecode_node const node_id = a.dict_find_string("id");
 		if (!node_id || node_id.string_length() != 20)
 		{
 			++invalid_req;
@@ -1014,6 +1014,9 @@ struct router_thread
 
 			if (is_duplicate) ++incoming_duplicates;
 
+			// if the node tells us that it's bootstrapping, we give it more nodes
+			bool const is_bootstrapping = (a.dict_find_int_value("bs", 0) == 1);
+
 			bencoder b(response, sizeof(response));
 			b.open_dict();
 
@@ -1051,7 +1054,7 @@ struct router_thread
 				}
 
 				// only return three nodes to duplicate requests, to save bandwidth
-				int const num_nodes = is_duplicate
+				int const num_nodes = is_duplicate || !is_bootstrapping
 					? std::min(3, nodes_in_response) : nodes_in_response;
 
 				if (want_v4)
