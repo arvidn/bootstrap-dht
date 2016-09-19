@@ -193,7 +193,7 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 	{
 		printf("%7s%10s%10s%10s%10s%10s%10s%10s%10s%10s%10s"
 #ifdef DEBUG_STATS
-			"%8s%8s%8s%8s"
+			"%8s%8s"
 #endif
 #ifdef CLIENTS_STAT
 			" %s"
