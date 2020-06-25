@@ -47,6 +47,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <unordered_map>
 #include <cinttypes> // for PRId64
 #include <array>
+#include <iomanip>
 
 #if BOOST_VERSION < 106600
 #include <boost/uuid/sha1.hpp>
@@ -149,6 +150,11 @@ std::array<std::atomic<uint32_t>, 2> nodebuf_size;
 
 time_point stats_start = steady_clock::now();
 
+std::string dump_ips_filename;
+
+std::chrono::system_clock::time_point const startup_system_time = std::chrono::system_clock::now();
+time_point const startup_steady_time = steady_clock::now();
+
 #ifdef DEBUG_STATS
 std::string suffix(int v)
 {
@@ -182,13 +188,13 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 		client_histogram.clear();
 	}
 	std::sort(ordered.begin(), ordered.end(), std::greater<>{});
-	char client_dist[250];
+	char client_dist[100];
 	client_dist[0] = '\0';
 	int len = 0;
 	for (auto i : ordered) {
 		if (len > sizeof(client_dist) - 10) break;
 		len += snprintf(client_dist + len, sizeof(client_dist) - len
-			, "[%c%c: %d] ", (i.second >> 8) & 0xff, i.second & 0xff, i.first);
+			, "%c%c:%d ", (i.second >> 8) & 0xff, i.second & 0xff, i.first);
 	}
 #endif
 
@@ -553,6 +559,34 @@ template<>
 void inc_backup_counter<address_v6>()
 { ++backup_nodes6_returned; }
 
+time_point quantize_to_hour(time_point const t)
+{
+	std::time_t const time = std::chrono::system_clock::to_time_t(
+		startup_system_time + (t - startup_steady_time));
+	std::tm const* input_time = std::gmtime(&time);
+	std::tm output_time{};
+	output_time.tm_year = input_time->tm_year;
+	output_time.tm_mon = input_time->tm_mon;
+	output_time.tm_mday = input_time->tm_mday;
+	output_time.tm_hour = input_time->tm_hour;
+
+	return startup_steady_time + (std::chrono::system_clock::from_time_t(
+		timegm(&output_time)) - startup_system_time);
+}
+std::string filename(std::chrono::system_clock::time_point const t)
+{
+	std::time_t const time = std::chrono::system_clock::to_time_t(t);
+	std::tm const* tm = std::gmtime(&time);
+	std::stringstream name;
+	name << std::setfill('0')
+		<< std::setw(2) << (tm->tm_year + 1900) // 4 digits of year
+		<< std::setw(2) << (tm->tm_mon + 1)
+		<< std::setw(2) << tm->tm_mday
+		<< "." << std::setw(2) << tm->tm_hour;
+
+	return name.str();
+}
+
 struct router_thread
 {
 	router_thread(char const* storage_dir, int const tid, std::vector<address> addrs)
@@ -560,8 +594,6 @@ struct router_thread
 		, ping_queue6(ping_queue_size, steady_clock::now())
 		, node_buffer4(storage_filename(storage_dir, tid, false).c_str(), node_buffer_size)
 		, node_buffer6(storage_filename(storage_dir, tid, true).c_str(), node_buffer_size)
-		, last_nodes4(16)
-		, last_nodes6(16)
 		, signals(ios)
 		, threadid(tid)
 	{
@@ -574,6 +606,16 @@ struct router_thread
 		{
 			fprintf(stderr, "no interfaces to receive on\n");
 			return;
+		}
+
+		if (!dump_ips_filename.empty())
+		{
+			auto const now = steady_clock::now();
+			auto const sys_time = startup_system_time + (now - startup_steady_time);
+			dump_ip_start = quantize_to_hour(now);
+			std::string const fn = filename(sys_time);
+			dump_ips = fopen((dump_ips_filename + "-" + std::to_string(threadid)
+				+ "-" + fn).c_str(), "wb+");
 		}
 
 		signals.add(SIGINT);
@@ -835,14 +877,18 @@ struct router_thread
 			return;
 		}
 
+		std::array<char, 4> client_id;
+		client_id.fill(0);
 #ifdef CLIENTS_STAT
 		std::string v = e.dict_find_string_value("v");
 		if (v.size() >= 2
 			&& std::isprint(uint8_t(v[0]))
-			&& std::isprint(uint8_t(v[1]))) {
+			&& std::isprint(uint8_t(v[1])))
+		{
 			std::lock_guard<std::mutex> l(client_mutex);
 			uint16_t client = (uint8_t(v[0]) << 8) | uint8_t(v[1]);
 			++client_histogram[client];
+			if (v.size() == 4) memcpy(client_id.data(), v.data(), 4);
 		}
 #endif
 		if (e.type() != bdecode_node::dict_t)
@@ -981,13 +1027,13 @@ struct router_thread
 		{
 			insert_response inserted = insert_response::inserted;
 
+			time_point const now = steady_clock::now();
+
 			// don't save read-only nodes
 			// for obvious invalid IPs
 			bdecode_node ro = e.dict_find_int("ro");
 			if (!ro || ro.int_value() == 0)
 			{
-				time_point const now = steady_clock::now();
-
 				if (is_v4)
 				{
 					node_entry_v4 e;
@@ -1034,6 +1080,25 @@ struct router_thread
 				|| check_duplicate(sock.ep.address(), recent_reqs4, recent_reqs6);
 
 			if (is_duplicate) ++incoming_duplicates;
+			else if (dump_ips && is_v4)
+			{
+				if (now > dump_ip_start + std::chrono::hours(1))
+				{
+					fclose(dump_ips);
+
+					auto const sys_time = startup_system_time + (now - startup_steady_time);
+					std::string const fn = filename(sys_time);
+					do { dump_ip_start += std::chrono::hours(1); } while (dump_ip_start > now);
+					dump_ips = fopen((dump_ips_filename + "-" + std::to_string(threadid)
+						+ "-" + fn).c_str(), "wb+");
+				}
+
+				address_v4::bytes_type b = sock.ep.address().to_v4().to_bytes();
+				fwrite(b.data(), b.size(), 1, dump_ips);
+				std::uint16_t const time = duration_cast<seconds>(now - dump_ip_start).count();
+				fwrite(&time, sizeof(time), 1, dump_ips);
+				fwrite(client_id.data(), client_id.size(), 1, dump_ips);
+			}
 
 			bencoder b(response, sizeof(response));
 			b.open_dict();
@@ -1124,11 +1189,15 @@ struct router_thread
 	node_buffer_v4 node_buffer4;
 	node_buffer_v6 node_buffer6;
 
+	FILE* dump_ips = nullptr;
+	int dump_ip_rotation = 1;
+	time_point dump_ip_start = steady_clock::now();
+
 	// always keep the last 16 nodes that have talked to us.
 	// these are used as backups when we don't have enough nodes
 	// in the node buffer
-	boost::circular_buffer<node_entry_v4> last_nodes4;
-	boost::circular_buffer<node_entry_v6> last_nodes6;
+	boost::circular_buffer<node_entry_v4> last_nodes4{16};
+	boost::circular_buffer<node_entry_v6> last_nodes6{16};
 
 	// the IP of every request is inserted in one of these sets. If we receive
 	// a request from an IP that's already in here, we return fewer nodes
@@ -1174,6 +1243,10 @@ void print_usage()
 		"--x-pollinate <ip> <port>\n"
 		"                      if the ping queue becomes too small, request more\n"
 		"                      nodes from this DHT node.\n"
+		"--dump-traffic <filename>\n"
+		"                      print all non-duplicate IPs to the specified\n"
+		"                      filename. It will rotate every hour and have a\n"
+		"                      timestamp appended.\n"
 		"\n"
 		"\n"
 	);
@@ -1370,6 +1443,11 @@ int main(int argc, char* argv[])
 			int version_num = atoi(argv[i] + 3);
 			version[2] = version_num >> 8;
 			version[3] = version_num & 0xff;
+		}
+		else if (argv[i] == "--dump-traffic"_s)
+		{
+			++i;
+			dump_ips_filename = argv[i];
 		}
 		else
 		{
