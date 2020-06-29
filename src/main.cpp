@@ -47,6 +47,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <unordered_map>
 #include <cinttypes> // for PRId64
 #include <array>
+#include <string_view>
 
 #if BOOST_VERSION < 106600
 #include <boost/uuid/sha1.hpp>
@@ -74,12 +75,15 @@ using boost::asio::steady_timer;
 using boost::system::error_code;
 using boost::asio::buffer;
 using std::chrono::steady_clock;
+using std::chrono::hours;
 using std::chrono::minutes;
 using std::chrono::seconds;
 using std::chrono::milliseconds;
 using std::chrono::duration_cast;
 using boost::uuids::detail::sha1;
 using namespace std::placeholders;
+
+using namespace std::literals::string_view_literals;
 
 using time_point = steady_clock::time_point;
 
@@ -94,11 +98,23 @@ bool verify_node_id = true;
 bool cross_pollinate = false;
 udp::endpoint bootstrap_node;
 int port = 6881;
+std::string dump_stats_filename;
 
-#ifdef CLIENTS_STAT
+using client_id_t = std::array<char, 4>;
+
+extern std::uint64_t hash_seed;
+
+struct client_hasher
+{
+	size_t operator()(client_id_t const& c) const
+	{
+		return CityHash64WithSeed(reinterpret_cast<char const*>(c.data())
+			, c.size(), hash_seed);
+	}
+};
+
 std::mutex client_mutex;
-std::unordered_map<uint16_t, int> client_histogram;
-#endif
+std::unordered_map<client_id_t, int, client_hasher> client_histogram;
 
 /*
 
@@ -149,6 +165,9 @@ std::array<std::atomic<uint32_t>, 2> nodebuf_size;
 
 time_point stats_start = steady_clock::now();
 
+std::chrono::system_clock::time_point const startup_system_time = std::chrono::system_clock::now();
+time_point const startup_steady_time = steady_clock::now();
+
 #ifdef DEBUG_STATS
 std::string suffix(int v)
 {
@@ -172,26 +191,6 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 
 	time_point const now = steady_clock::now();
 
-#ifdef CLIENTS_STAT
-	std::vector<std::pair<int, uint16_t>> ordered;
-	{
-		std::lock_guard<std::mutex> l(client_mutex);
-		for (auto i : client_histogram) {
-			ordered.emplace_back(i.second, i.first);
-		}
-		client_histogram.clear();
-	}
-	std::sort(ordered.begin(), ordered.end(), std::greater<>{});
-	char client_dist[250];
-	client_dist[0] = '\0';
-	int len = 0;
-	for (auto i : ordered) {
-		if (len > sizeof(client_dist) - 10) break;
-		len += snprintf(client_dist + len, sizeof(client_dist) - len
-			, "[%c%c: %d] ", (i.second >> 8) & 0xff, i.second & 0xff, i.first);
-	}
-#endif
-
 	// every 40th line is a repeat of the header
 	static std::uint8_t cnt = 0;
 	if (cnt == 0)
@@ -200,17 +199,11 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 #ifdef DEBUG_STATS
 			"%8s%8s"
 #endif
-#ifdef CLIENTS_STAT
-			" %s"
-#endif
 			"\n"
 			, "time(s)", "dup-ip", "inv-msg", "inv-src", "resp"
 			, "id-fail", "out-ping", "inv-pong", "added", "backup4", "backup6"
 #ifdef DEBUG_STATS
 			, "buf4", "buf6"
-#endif
-#ifdef CLIENTS_STAT
-			, "client distribution"
 #endif
 			);
 	}
@@ -219,9 +212,6 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 	printf("%7" PRId64 "%10u%10u%10u%10u%10u%10u%10u%10u%10u%10u"
 #ifdef DEBUG_STATS
 		"%8s%8s"
-#endif
-#ifdef CLIENTS_STAT
-		" %s"
 #endif
 		"\n"
 		, duration_cast<seconds>(now - stats_start).count()
@@ -238,9 +228,6 @@ void print_stats(steady_timer& stats_timer, error_code const& ec)
 #ifdef DEBUG_STATS
 		, suffix(nodebuf_size[0].load()).c_str()
 		, suffix(nodebuf_size[1].load()).c_str()
-#endif
-#ifdef CLIENTS_STAT
-		, client_dist
 #endif
 		);
 
@@ -576,6 +563,11 @@ struct router_thread
 			return;
 		}
 
+		if (threadid == 0 && !dump_stats_filename.empty())
+		{
+			dump_stats = fopen(dump_stats_filename.c_str(), "a+");
+		}
+
 		signals.add(SIGINT);
 		signals.add(SIGTERM);
 
@@ -835,16 +827,41 @@ struct router_thread
 			return;
 		}
 
-#ifdef CLIENTS_STAT
-		std::string v = e.dict_find_string_value("v");
-		if (v.size() >= 2
-			&& std::isprint(uint8_t(v[0]))
-			&& std::isprint(uint8_t(v[1]))) {
-			std::lock_guard<std::mutex> l(client_mutex);
-			uint16_t client = (uint8_t(v[0]) << 8) | uint8_t(v[1]);
-			++client_histogram[client];
+		if (!dump_stats_filename.empty())
+		{
+			std::string v = e.dict_find_string_value("v");
+			if (!v.empty())
+			{
+				// we expect 4 characters; 2 printable and a 16 bit integer for
+				// version
+				client_id_t client_id;
+				client_id.fill(0);
+				std::copy(v.begin(), v.begin() + std::min(v.size(), client_id.size()), client_id.begin());
+				if (!std::isprint(std::uint8_t(v[0])) || !std::isprint(std::uint8_t(v[1])))
+				{
+					// all random clients version get collapsed into all zeros
+					client_id.fill(0);
+				}
+				else
+				{
+					// this is a way to mitigate abuse by someone sending random
+					// printable characters as the first two characters
+					static std::set<std::string_view> const known_clients = {
+						"LT"sv, "UT"sv, "LZ"sv, "NS"sv, "Az"sv, "TX"sv, "JC",
+						"lt"sv, "ml"sv,"A2"sv, "MO"sv, "SZ"sv, "mB"sv, "gB"sv,
+						"TR"sv, "SY"sv
+					};
+					if (known_clients.find(std::string_view(client_id.data(), 2)) == known_clients.end())
+					{
+						client_id[2] = 0;
+						client_id[3] = 0;
+					}
+				}
+				std::lock_guard<std::mutex> l(client_mutex);
+				++client_histogram[client_id];
+			}
 		}
-#endif
+
 		if (e.type() != bdecode_node::dict_t)
 		{
 			++invalid_req;
@@ -981,13 +998,13 @@ struct router_thread
 		{
 			insert_response inserted = insert_response::inserted;
 
+			time_point const now = steady_clock::now();
+
 			// don't save read-only nodes
 			// for obvious invalid IPs
 			bdecode_node ro = e.dict_find_int("ro");
 			if (!ro || ro.int_value() == 0)
 			{
-				time_point const now = steady_clock::now();
-
 				if (is_v4)
 				{
 					node_entry_v4 e;
@@ -1034,6 +1051,28 @@ struct router_thread
 				|| check_duplicate(sock.ep.address(), recent_reqs4, recent_reqs6);
 
 			if (is_duplicate) ++incoming_duplicates;
+
+			if (dump_stats && now > dump_stats_start + std::chrono::hours(1))
+			{
+				auto const sys_time = startup_system_time + (now - startup_steady_time);
+				std::uint32_t const ts = duration_cast<hours>(sys_time.time_since_epoch()).count();
+				fwrite(&ts, sizeof(ts), 1, dump_stats);
+				dump_stats_start += std::chrono::hours(1);
+
+
+				std::unordered_map<client_id_t, int, client_hasher> clients;
+				{
+					std::lock_guard<std::mutex> l(client_mutex);
+					client_histogram.swap(clients);
+				}
+
+				std::int32_t const count = clients.size();
+				fwrite(&count, sizeof(count), 1, dump_stats);
+				for (auto i : clients) {
+					fwrite(i.first.data(), i.first.size(), 1, dump_stats);
+					fwrite(&i.second, sizeof(i.second), 1, dump_stats);
+				}
+			}
 
 			bencoder b(response, sizeof(response));
 			b.open_dict();
@@ -1124,6 +1163,9 @@ struct router_thread
 	node_buffer_v4 node_buffer4;
 	node_buffer_v6 node_buffer6;
 
+	FILE* dump_stats = nullptr;
+	time_point dump_stats_start = steady_clock::now();
+
 	// always keep the last 16 nodes that have talked to us.
 	// these are used as backups when we don't have enough nodes
 	// in the node buffer
@@ -1174,6 +1216,8 @@ void print_usage()
 		"--x-pollinate <ip> <port>\n"
 		"                      if the ping queue becomes too small, request more\n"
 		"                      nodes from this DHT node.\n"
+		"--dump-stats <file>   print hourly histogram of client versions of\n"
+		"                      incoming packets to the specified file\n"
 		"\n"
 		"\n"
 	);
@@ -1222,12 +1266,12 @@ int main(int argc, char* argv[])
 
 	for (int i = 2; i < argc; ++i)
 	{
-		if (argv[i] == "--help"_s)
+		if (argv[i] == "--help"sv)
 		{
 			print_usage();
 			return 0;
 		}
-		else if (argv[i] == "--threads"_s)
+		else if (argv[i] == "--threads"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1243,7 +1287,7 @@ int main(int argc, char* argv[])
 			}
 			if (num_threads <= 0) num_threads = 1;
 		}
-		else if (argv[i] == "--nodes"_s)
+		else if (argv[i] == "--nodes"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1259,7 +1303,7 @@ int main(int argc, char* argv[])
 					, node_buffer_size);
 			}
 		}
-		else if (argv[i] == "--ping-queue"_s)
+		else if (argv[i] == "--ping-queue"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1275,7 +1319,7 @@ int main(int argc, char* argv[])
 					, ping_queue_size);
 			}
 		}
-		else if (argv[i] == "--dir"_s)
+		else if (argv[i] == "--dir"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1285,7 +1329,7 @@ int main(int argc, char* argv[])
 			}
 			storage_dir = argv[i];
 		}
-		else if (argv[i] == "--port"_s)
+		else if (argv[i] == "--port"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1295,7 +1339,7 @@ int main(int argc, char* argv[])
 			}
 			port = atoi(argv[i]);
 		}
-		else if (argv[i] == "--response-size"_s)
+		else if (argv[i] == "--response-size"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1310,7 +1354,7 @@ int main(int argc, char* argv[])
 				return 1;
 			}
 		}
-		else if (argv[i] == "--x-pollinate"_s)
+		else if (argv[i] == "--x-pollinate"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1335,18 +1379,18 @@ int main(int argc, char* argv[])
 			bootstrap_node.port(atoi(argv[i]));
 			cross_pollinate = true;
 		}
-		else if (argv[i] == "--no-verify-id"_s)
+		else if (argv[i] == "--no-verify-id"sv)
 		{
 			verify_node_id = false;
 		}
-		else if (argv[i] == "--ipv6"_s)
+		else if (argv[i] == "--ipv6"sv)
 		{
 			++i;
 			address_v6 addr = address_v6::from_string(argv[i], ec);
 			if (!ec)
 				bind_addrs.push_back(addr);
 		}
-		else if (argv[i] == "--version"_s)
+		else if (argv[i] == "--version"sv)
 		{
 			++i;
 			if (i >= argc)
@@ -1370,6 +1414,16 @@ int main(int argc, char* argv[])
 			int version_num = atoi(argv[i] + 3);
 			version[2] = version_num >> 8;
 			version[3] = version_num & 0xff;
+		}
+		else if (argv[i] == "--dump-stats"sv)
+		{
+			++i;
+			if (i >= argc)
+			{
+				fprintf(stderr, "--dump-stats expects a filename\n");
+				return 1;
+			}
+			dump_stats_filename = argv[i];
 		}
 		else
 		{
