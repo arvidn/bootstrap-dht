@@ -48,6 +48,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <cinttypes> // for PRId64
 #include <array>
 #include <string_view>
+#include <iostream>
 
 #if BOOST_VERSION < 106600
 #include <boost/uuid/sha1.hpp>
@@ -1243,7 +1244,7 @@ void signal_handler(error_code const& e, int const signo, signal_set& signals
 std::string operator "" _s(const char* str, size_t len)
 { return std::string(str, len); }
 
-int main(int argc, char* argv[])
+int main(int argc, char* argv[]) try
 {
 	if (argc < 2)
 	{
@@ -1483,8 +1484,14 @@ int main(int argc, char* argv[])
 	threads.reserve(num_threads);
 	for (int i = 0; i < num_threads; ++i) {
 		threads.emplace_back([=]{
-			router_thread t(storage_dir, i, bind_addrs);
-			t.start();
+			try {
+				router_thread t(storage_dir, i, bind_addrs);
+				t.start();
+			}
+			catch (std::exception const& e)
+			{
+				std::cerr << "ERROR in thread " << i << " " << e.what() << '\n';
+			}
 		});
 	}
 
@@ -1514,5 +1521,9 @@ int main(int argc, char* argv[])
 	delete[] intermediate.load();
 
 	return 0;
+}
+catch (std::exception const& e)
+{
+	std::cerr << "ERROR: " << e.what() << '\n';
 }
 
