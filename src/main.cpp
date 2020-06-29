@@ -850,7 +850,7 @@ struct router_thread
 					static std::set<std::string_view> const known_clients = {
 						"LT"sv, "UT"sv, "LZ"sv, "NS"sv, "Az"sv, "TX"sv, "JC",
 						"lt"sv, "ml"sv,"A2"sv, "MO"sv, "SZ"sv, "mB"sv, "gB"sv,
-						"TR"sv, "SY"sv
+						"TR"sv, "SY"sv, "GR"sv, "AZ"sv, "BF"sv, "BT"sv, "DP"sv
 					};
 					if (known_clients.find(std::string_view(client_id.data(), 2)) == known_clients.end())
 					{

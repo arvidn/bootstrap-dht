@@ -19,12 +19,8 @@ project
 	: usage-requirements
 	;
 
-exe dht-bootstrap :
-	src/main.cpp src/bdecode.cpp src/city.cc src/ip_set.cpp
-	;
+exe dht-bootstrap : src/main.cpp src/bdecode.cpp src/city.cc src/ip_set.cpp ;
+exe dht-torture : src/dht-torture.cpp src/bdecode.cpp ;
+exe print-stats : src/print_stats.cpp ;
 
-exe dht-torture :
-	src/dht-torture.cpp src/bdecode.cpp
-	;
-
-install stage : dht-bootstrap dht-torture : <location>. ;
+install stage : dht-bootstrap dht-torture print-stats : <location>. ;
